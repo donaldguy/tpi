@@ -12,13 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{builder::NonEmptyStringValueParser, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-
-#[cfg(not(feature = "localhost"))]
-const DEFAULT_HOST_NAME: &str = "turingpi.local";
-#[cfg(feature = "localhost")]
-const DEFAULT_HOST_NAME: &str = "127.0.0.1";
 
 /// Commandline interface that controls turing-pi's BMC. The BMC must be connected to a network
 /// that is reachable over TCP/IP in order for this tool to function. All commands are persisted by
@@ -31,32 +26,17 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Specify the Turing-pi host to connect to. Note: IPv6 addresses must be wrapped in square
-    /// brackets e.g. `[::1]`
-    #[arg(default_value = DEFAULT_HOST_NAME, value_parser = NonEmptyStringValueParser::new(), long, global = true, env = "TPI_HOSTNAME")]
-    pub host: Option<String>,
+    #[command(flatten, next_help_heading = "API Options (Global)")]
+    pub api_args: crate::api::ApiArgs,
 
-    /// Specify a custom port to connect to.
-    #[arg(long, global = true, env = "TPI_PORT")]
-    pub port: Option<u16>,
-
-    /// Specify a user name to log in as. If unused, an interactive prompt will ask for credentials
-    /// unless a cached token file is present.
-    #[arg(long, global = true, env = "TPI_USERNAME")]
-    pub user: Option<String>,
-
-    /// Same as `--username`
-    #[arg(long, name = "PASS", global = true, env = "TPI_PASSWORD", hide_env_values = true)]
-    pub password: Option<String>,
+    #[command(flatten, next_help_heading = "Authentication Options (Global)")]
+    pub auth_args: crate::auth::AuthArgs,
 
     /// Print results formatted as JSON
     #[arg(long, global = true, env = "TPI_OUTPUT_JSON")]
     pub json: bool,
 
-    /// Force which version of the BMC API to use. Try lower the version if you are running
-    /// older BMC firmware.
-    #[arg(default_value = "v1-1", short, global = true)]
-    pub api_version: Option<ApiVersion>,
+
 
     #[arg(short, name = "gen completion", exclusive = true)]
     pub gencompletion: Option<clap_complete::shells::Shell>,
@@ -142,20 +122,6 @@ pub enum EthCmd {
     Reset,
 }
 
-#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub enum ApiVersion {
-    V1,
-    V1_1,
-}
-
-impl ApiVersion {
-    pub fn scheme(&self) -> &str {
-        match self {
-            ApiVersion::V1 => "http",
-            ApiVersion::V1_1 => "https",
-        }
-    }
-}
 
 #[derive(Args, Clone)]
 pub struct EthArgs {

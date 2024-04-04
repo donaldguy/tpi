@@ -12,23 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod api;
+mod auth;
 mod cli;
 mod legacy_handler;
 mod prompt;
 mod request;
 
 use crate::legacy_handler::LegacyHandler;
-use clap::{CommandFactory, Parser};
+use crate::auth::Auth;
+use clap::{ArgMatches, CommandFactory, FromArgMatches };
 use clap_complete::generate;
 use cli::Cli;
 use std::{io, process::ExitCode};
 
+
+
+// ideally I'd prefer to look for something that suggests a _running_ bmcd
+pub fn is_running_on_tpi_bmc() -> bool {
+    std::env::consts::OS == "linux" &&
+    std::fs::read_to_string(std::path::Path::new("/sys/firmware/devicetree/base/model"))
+        .unwrap_or_default()
+        .starts_with("Turing Pi")
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if let Some(shell) = cli.gencompletion {
+    let cli_arg_matches = Cli::command().get_matches();
+
+
+    if let Some(shell) = cli_arg_matches.get_one::<clap_complete::shells::Shell>("gen completion") {
         generate(
-            shell,
+            shell.to_owned(),
             &mut Cli::command(),
             env!("CARGO_PKG_NAME"),
             &mut io::stdout(),
@@ -36,7 +51,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Err(e) = execute_cli_command(&cli).await {
+    if let Err(e) = execute_cli_command(cli_arg_matches).await {
         if let Some(error) = e.downcast_ref::<reqwest::Error>() {
             println!("{error}");
         } else {
@@ -48,7 +63,9 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn execute_cli_command(cli: &Cli) -> anyhow::Result<()> {
+async fn execute_cli_command(arg_matches: ArgMatches) -> anyhow::Result<()> {
+    let cli = Cli::from_arg_matches(&arg_matches).unwrap();
+
     let command = cli.command.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "subcommand must be specified!\n\n{}",
@@ -56,13 +73,14 @@ async fn execute_cli_command(cli: &Cli) -> anyhow::Result<()> {
         )
     })?;
 
-    let host = url::Host::parse(cli.host.as_ref().expect("host has a default set"))
-        .map_err(|_| anyhow::anyhow!("please enter a valid hostname"))?;
-    let mut host = host.to_string();
-    // connect to specific port if specified.
-    if let Some(port) = cli.port {
-        host.push_str(&format!(":{}", port));
-    }
 
-    LegacyHandler::new(host, cli)?.handle_cmd(command).await
+
+    let auth =
+        if cfg!(feature = "localhost") {
+            Auth::Local
+        } else {
+            Auth::from_arg_matches(&arg_matches)
+        };
+
+    LegacyHandler::new(&cli, auth)?.handle_cmd(command).await
 }

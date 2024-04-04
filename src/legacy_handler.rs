@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::auth::Auth;
+use crate::api::{Api, ApiVersion};
 use crate::cli::{
-    AdvancedArgs, ApiVersion, Cli, Commands, EthArgs, EthCmd, FirmwareArgs, GetSet, PowerArgs,
+    AdvancedArgs, Cli, Commands, EthArgs, EthCmd, FirmwareArgs, GetSet, PowerArgs,
     PowerCmd, UartArgs, UsbArgs,
 };
 use crate::cli::{FlashArgs, UsbCmd};
@@ -39,34 +41,33 @@ type ResponsePrinter = fn(&serde_json::Value) -> anyhow::Result<()>;
 /// size)
 const MULTIPART_BUFFER_SIZE: usize = 1024 * 32;
 
-pub struct LegacyHandler {
-    request: Request,
-    client: Client,
+pub struct LegacyHandler<'a> {
+    api: Api,
+    //auth: Auth,
+    request: Request<'a>,
     response_printer: Option<ResponsePrinter>,
     json: bool,
-    skip_request: bool,
-    version: ApiVersion,
+    skip_request: bool
 }
 
-impl LegacyHandler {
-    fn create_client(version: ApiVersion) -> anyhow::Result<Client> {
-        if version == ApiVersion::V1 {
-            return Ok(Client::new());
-        }
+impl <'a> LegacyHandler<'a> {
+    fn create_client(api_version: &ApiVersion, user_agent: &String) -> anyhow::Result<Client> {
+        let client = ClientBuilder::new().user_agent(user_agent);
 
-        let client = ClientBuilder::new()
-            .gzip(true)
-            .danger_accept_invalid_certs(true)
-            .http1_only()
-            .https_only(true)
-            .build()?;
-        Ok(client)
+        match api_version {
+            ApiVersion::V1 => Ok(client.build()?),
+            ApiVersion::V1_1 => Ok(
+                client
+                .gzip(true)
+                .danger_accept_invalid_certs(true)
+                .http1_only()
+                .https_only(true)
+                .build()?
+            )
+        }
     }
 
-    pub fn new(host: String, args: &Cli) -> anyhow::Result<Self> {
-        let json = args.json;
-        let version = args.api_version.expect("Missing API version");
-        let creds = (args.user.clone(), args.password.clone());
+    pub fn new(cli: &Cli, auth: Auth) -> anyhow::Result<Self> {
         let user_agent = PlatformInfo::new()
             .map(|nfo| {
                 format!(
@@ -77,16 +78,17 @@ impl LegacyHandler {
                 )
             })
             .unwrap_or("TPI".to_string());
-        let request = Request::new(host, version, creds, &user_agent)?;
-        let client = Self::create_client(version)?;
+
+        let api = crate::api::Api::new(&cli.api_args);
+        let client = Self::create_client(&api.version, &user_agent)?;
+        let request = Request::new(&api, &auth, client);
 
         Ok(Self {
+            api,
             request,
-            client,
             response_printer: None,
-            json,
+            json: cli.json,
             skip_request: false,
-            version,
         })
     }
 
@@ -109,7 +111,7 @@ impl LegacyHandler {
             return Ok(());
         }
 
-        let response = self.request.send(self.client).await?;
+        let response = self.request.send().await?;
         let status = response.status();
         let bytes = response.bytes().await?;
 
@@ -210,7 +212,7 @@ impl LegacyHandler {
 
     async fn handle_firmware(&mut self, args: &FirmwareArgs) -> anyhow::Result<()> {
         let (mut file, file_name, size) = Self::open_file(&args.file).await?;
-        if self.version == ApiVersion::V1 {
+        if self.api.version == ApiVersion::V1 {
             // Opt out of the global request/response handler as we implement an
             // alternative flow here.
             self.skip_request = true;
@@ -292,7 +294,7 @@ impl LegacyHandler {
                 .append_key_only("skip_crc");
         }
 
-        if self.version == ApiVersion::V1 {
+        if self.request.api.version == ApiVersion::V1 {
             self.handle_file_upload_v1(&mut file, file_name).await
         } else {
             self.handle_file_upload_v1_1(file, file_size).await
@@ -309,9 +311,9 @@ impl LegacyHandler {
             .append_pair("file", &args.image_path.to_string_lossy())
             .append_pair("node", &(args.node - 1).to_string());
 
-        let response = self.request.clone().send(self.client.clone()).await?;
+        let response = self.request.clone().send().await?;
         let status = response.status();
-        let json_res = response.json::<serde_json::Value>().await;
+        let json_res: serde_json::Result<serde_json::Value> = response.json::<serde_json::Value>().await;
 
         if !status.is_success() {
             if let Ok(json) = &json_res {
@@ -337,7 +339,6 @@ impl LegacyHandler {
         let initial_delay = Duration::from_secs(3);
         let update_period = Duration::from_millis(500);
 
-        let client = self.client.clone();
         let mut req = self.request.clone();
 
         req.url_mut()
@@ -355,7 +356,7 @@ impl LegacyHandler {
             loop {
                 let response = req
                     .clone()
-                    .send(client.clone())
+                    .send()
                     .await
                     .expect("Failed to send progress status request");
 
@@ -428,7 +429,7 @@ impl LegacyHandler {
             .mime_str("application/octet-stream")?
             .file_name(file_name);
         let form = reqwest::multipart::Form::new().part("file", part);
-        self.client
+        self.request.client
             .post(self.request.url().clone())
             .multipart(form)
             .send()
@@ -439,7 +440,7 @@ impl LegacyHandler {
     async fn handle_file_upload_v1_1(&self, file: File, file_size: u64) -> anyhow::Result<()> {
         let req = self.request.clone();
         let response = req
-            .send(self.client.clone())
+            .send()
             .await
             .context("flash request")?;
 
@@ -457,7 +458,7 @@ impl LegacyHandler {
             reqwest::multipart::Part::stream_with_length(Body::wrap_stream(stream), file_size)
                 .mime_str("application/octet-stream")?;
 
-        let mut multipart_request = self.request.to_post()?;
+        let mut multipart_request = self.request.post();
         multipart_request
             .url_mut()
             .path_segments_mut()
@@ -467,7 +468,7 @@ impl LegacyHandler {
 
         let form = reqwest::multipart::Form::new().part("file", stream_part);
         multipart_request.set_multipart(form);
-        multipart_request.send(self.client.clone()).await?;
+        multipart_request.send().await?;
 
         let progress_watcher = self.create_progress_watching_thread(handle);
         progress_watcher.await.expect("failed to wait for thread");
@@ -553,7 +554,7 @@ impl LegacyHandler {
                     .append_pair("opt", "set")
                     .append_pair("type", "clear_usb_boot")
                     .append_pair("node", &(args.node - 1).to_string());
-                let response = self.request.clone().send(self.client.clone()).await?;
+                let response = self.request.clone().send().await?;
 
                 if !response.status().is_success() {
                     bail!("could not execute Normal mode: {}", response.text().await?);
